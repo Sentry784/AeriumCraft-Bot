@@ -2,10 +2,13 @@ const { Client, GatewayIntentBits, Events } = require('discord.js');
 const fetch = require('node-fetch');
 const fs = require('fs');
 
-// ── Config ──────────────────────────────────────────────────
-const DISCORD_TOKEN  = process.env.DISCORD_TOKEN;
-const OPENROUTER_KEY = process.env.OPENROUTER_KEY;
+// ── Config ────────────────────────────────────────────────────────────────────
+const DISCORD_TOKEN   = process.env.DISCORD_TOKEN;
+const GEMINI_API_KEY  = process.env.GEMINI_API_KEY;
 const ALLOWED_CHANNEL = process.env.CHANNEL_ID || '1420032798579884053';
+
+const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
 const knowledge = fs.readFileSync('./knowledge.json', 'utf8');
 
@@ -48,7 +51,7 @@ You are a knowledgeable, friendly guide for AeriumCraft. You know everything abo
 ━━━ KNOWLEDGE BASE ━━━
 ${knowledge}`;
 
-// ── Conversation history per user (in-memory) ───────────────
+// ── Conversation history per user (in-memory) ─────────────────────────────────
 const histories = new Map();
 const MAX_HISTORY = 6;
 
@@ -63,49 +66,76 @@ function addToHistory(userId, role, content) {
   if (hist.length > MAX_HISTORY) hist.splice(0, hist.length - MAX_HISTORY);
 }
 
-// ── OpenRouter call ─────────────────────────────────────────
+// ── Gemini API call ───────────────────────────────────────────────────────────
 async function askAI(userId, userMessage) {
   addToHistory(userId, 'user', userMessage);
   const history = getHistory(userId);
 
-  const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    ...history
-  ];
+  // Convert history to Gemini format (user/model roles, no system)
+  const contents = history.map(m => ({
+    role:  m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }]
+  }));
 
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${OPENROUTER_KEY}`,
-      'HTTP-Referer': 'https://aeriumcraft.xyz',
-      'X-Title': 'AeriumCraft AI Bot'
+  // Gemini requires conversation to start with a user turn
+  if (contents.length > 0 && contents[0].role === 'model') {
+    contents.unshift({ role: 'user', parts: [{ text: 'Hello' }] });
+  }
+
+  const payload = {
+    system_instruction: {
+      parts: [{ text: SYSTEM_PROMPT }]
     },
-    body: JSON.stringify({
-      model: 'openrouter/free',
-      messages,
-      max_tokens: 600,
+    contents,
+    generationConfig: {
+      maxOutputTokens: 600,
       temperature: 0.65
-    })
+    }
+  };
+
+  const res = await fetch(GEMINI_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
   });
 
   const data = await res.json();
-  let reply = data?.choices?.[0]?.message?.content || "Sorry, I couldn't respond properly.";
 
-  // Enforce Discord's 2000-character limit — truncate cleanly at a word boundary
-  const MAX_LENGTH = 1900;
-  if (reply.length > MAX_LENGTH) {
-    const truncated = reply.slice(0, MAX_LENGTH);
-    // Walk back to the last whitespace so we don't cut mid-word or mid-emoji
-    const lastSpace = truncated.lastIndexOf(' ');
-    reply = (lastSpace > 0 ? truncated.slice(0, lastSpace) : truncated) + '...';
+  // ── Error handling ──────────────────────────────────────────────────────────
+  if (data.error) {
+    const code = data.error.code ?? 0;
+    const msg  = data.error.message ?? 'Unknown error';
+    console.error(`[Gemini Error ${code}]`, msg);
+
+    const friendly = {
+      401: "Invalid Gemini API key.",
+      403: "Gemini API access denied.",
+      429: "Rate limit hit. Try again in a moment.",
+      500: "Gemini is temporarily unavailable.",
+      503: "Gemini is temporarily unavailable."
+    }[code] ?? `Gemini error (${code}): ${msg}`;
+
+    throw new Error(friendly);
   }
 
-  addToHistory(userId, 'assistant', reply);
-  return reply;
+  // Safety block
+  const finishReason = data.candidates?.[0]?.finishReason;
+  if (finishReason === 'SAFETY') {
+    console.warn('[Gemini] Response blocked by safety filters.');
+    throw new Error("Response blocked by safety filters.");
+  }
+
+  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text
+    ?? "Sorry, I couldn't respond properly.";
+
+  // Trim to Discord's 2000 char limit (with buffer for reply mention)
+  const trimmed = reply.length > 1800 ? reply.slice(0, 1797) + '...' : reply;
+
+  addToHistory(userId, 'assistant', trimmed);
+  return trimmed;
 }
 
-// ── Discord client ──────────────────────────────────────────
+// ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -116,20 +146,19 @@ const client = new Client({
 
 client.once(Events.ClientReady, () => {
   console.log(`AeriumCraft AI Bot is online as ${client.user.tag}`);
+  console.log(`Gemini model: ${GEMINI_MODEL}`);
+  console.log(`Allowed channel: ${ALLOWED_CHANNEL}`);
 });
 
 client.on(Events.MessageCreate, async (message) => {
-  // Ignore bots and messages outside allowed channel
   if (message.author.bot) return;
   if (message.channel.id !== ALLOWED_CHANNEL) return;
 
-  // Only respond if bot is mentioned OR message starts with "?" OR bot's name is in message
   const botMentioned = message.mentions.has(client.user);
   const isQuestion   = message.content.trim().startsWith('?');
 
   if (!botMentioned && !isQuestion) return;
 
-  // Clean up the message
   let userText = message.content
     .replace(`<@${client.user.id}>`, '')
     .replace(/^\?/, '')
@@ -139,18 +168,14 @@ client.on(Events.MessageCreate, async (message) => {
     return message.reply('Ask me anything about AeriumCraft!');
   }
 
-  // Show typing indicator
   await message.channel.sendTyping();
 
   try {
     const reply = await askAI(message.author.id, userText);
-    // Reply and mention the user
     await message.reply(reply);
   } catch (err) {
-    console.error('AI Error:', err?.message ?? err);
-    if (err?.code) console.error('Discord error code:', err.code);
-    if (err?.rawError) console.error('Raw API error:', JSON.stringify(err.rawError));
-    await message.reply("Sorry, I couldn't respond right now. Try again in a moment.");
+    console.error('[Bot Error]', err.message);
+    await message.reply(`Sorry, something went wrong: ${err.message}`);
   }
 });
 
