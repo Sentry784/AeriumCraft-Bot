@@ -90,7 +90,17 @@ async function askAI(userId, userMessage) {
   });
 
   const data = await res.json();
-  const reply = data?.choices?.[0]?.message?.content || "Sorry, I couldn't respond properly.";
+  let reply = data?.choices?.[0]?.message?.content || "Sorry, I couldn't respond properly.";
+
+  // Enforce Discord's 2000-character limit — truncate cleanly at a word boundary
+  const MAX_LENGTH = 1900;
+  if (reply.length > MAX_LENGTH) {
+    const truncated = reply.slice(0, MAX_LENGTH);
+    // Walk back to the last whitespace so we don't cut mid-word or mid-emoji
+    const lastSpace = truncated.lastIndexOf(' ');
+    reply = (lastSpace > 0 ? truncated.slice(0, lastSpace) : truncated) + '...';
+  }
+
   addToHistory(userId, 'assistant', reply);
   return reply;
 }
@@ -137,7 +147,9 @@ client.on(Events.MessageCreate, async (message) => {
     // Reply and mention the user
     await message.reply(reply);
   } catch (err) {
-    console.error('AI Error:', err);
+    console.error('AI Error:', err?.message ?? err);
+    if (err?.code) console.error('Discord error code:', err.code);
+    if (err?.rawError) console.error('Raw API error:', JSON.stringify(err.rawError));
     await message.reply("Sorry, I couldn't respond right now. Try again in a moment.");
   }
 });
