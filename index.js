@@ -5,10 +5,13 @@ const fs = require('fs');
 // ── Config ────────────────────────────────────────────────────────────────────
 const DISCORD_TOKEN   = process.env.DISCORD_TOKEN;
 const GEMINI_API_KEY  = process.env.GEMINI_API_KEY;
+const GROQ_API_KEY    = process.env.GROQ_API_KEY;
 const ALLOWED_CHANNEL = process.env.CHANNEL_ID || '1420032798579884053';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+const GROQ_URL     = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL   = 'llama-3.3-70b-versatile';
 
 const knowledge = fs.readFileSync('./knowledge.json', 'utf8');
 
@@ -67,30 +70,20 @@ function addToHistory(userId, role, content) {
 }
 
 // ── Gemini API call ───────────────────────────────────────────────────────────
-async function askAI(userId, userMessage) {
-  addToHistory(userId, 'user', userMessage);
-  const history = getHistory(userId);
-
-  // Convert history to Gemini format (user/model roles, no system)
+async function callGemini(history) {
   const contents = history.map(m => ({
     role:  m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }]
   }));
 
-  // Gemini requires conversation to start with a user turn
   if (contents.length > 0 && contents[0].role === 'model') {
     contents.unshift({ role: 'user', parts: [{ text: 'Hello' }] });
   }
 
   const payload = {
-    system_instruction: {
-      parts: [{ text: SYSTEM_PROMPT }]
-    },
+    system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents,
-    generationConfig: {
-      maxOutputTokens: 600,
-      temperature: 0.65
-    }
+    generationConfig: { maxOutputTokens: 600, temperature: 0.65 }
   };
 
   const res = await fetch(GEMINI_URL, {
@@ -101,36 +94,106 @@ async function askAI(userId, userMessage) {
 
   const data = await res.json();
 
-  // ── Error handling ──────────────────────────────────────────────────────────
   if (data.error) {
     const code = data.error.code ?? 0;
     const msg  = data.error.message ?? 'Unknown error';
     console.error(`[Gemini Error ${code}]`, msg);
-
-    const friendly = {
-      401: "Invalid Gemini API key.",
-      403: "Gemini API access denied.",
-      429: "Rate limit hit. Try again in a moment.",
-      500: "Gemini is temporarily unavailable.",
-      503: "Gemini is temporarily unavailable."
-    }[code] ?? `Gemini error (${code}): ${msg}`;
-
-    throw new Error(friendly);
+    return { reply: null, error: { code, msg } };
   }
 
-  // Safety block
   const finishReason = data.candidates?.[0]?.finishReason;
   if (finishReason === 'SAFETY') {
     console.warn('[Gemini] Response blocked by safety filters.');
-    throw new Error("Response blocked by safety filters.");
+    return { reply: null, error: { code: 'SAFETY', msg: 'Safety block' } };
   }
 
-  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text
-    ?? "Sorry, I couldn't respond properly.";
+  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text ?? null;
+  return { reply, error: null };
+}
 
-  // Trim to Discord's 2000 char limit (with buffer for reply mention)
+// ── Groq API call (fallback) ──────────────────────────────────────────────────
+async function callGroq(history) {
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    ...history.map(m => ({ role: m.role, content: m.content }))
+  ];
+
+  const res = await fetch(GROQ_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${GROQ_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages,
+      max_tokens: 600,
+      temperature: 0.65
+    })
+  });
+
+  const data = await res.json();
+
+  if (data.error) {
+    const msg = data.error.message ?? 'Unknown Groq error';
+    console.error('[Groq Error]', msg);
+    return { reply: null, error: msg };
+  }
+
+  const reply = data.choices?.[0]?.message?.content ?? null;
+  return { reply, error: null };
+}
+
+// ── Friendly error messages ───────────────────────────────────────────────────
+function geminiErrorMessage(code) {
+  return {
+    401: 'Invalid Gemini API key.',
+    403: 'Gemini API access denied.',
+    429: 'Rate limit hit. Switching to backup AI...',
+    500: 'Gemini is temporarily unavailable. Switching to backup AI...',
+    503: 'Gemini is temporarily unavailable. Switching to backup AI...'
+  }[code] ?? null;
+}
+
+// ── Main AI handler (Gemini → Groq fallback) ──────────────────────────────────
+async function askAI(userId, userMessage) {
+  addToHistory(userId, 'user', userMessage);
+  const history = getHistory(userId);
+
+  // 1. Try Gemini
+  const geminiResult = await callGemini(history);
+
+  let reply = null;
+  let modelUsed = 'gemini';
+
+  if (geminiResult.reply) {
+    reply = geminiResult.reply;
+  } else {
+    const errCode = geminiResult.error?.code;
+
+    // Fallback on rate limit / server errors
+    const shouldFallback = [429, 500, 503].includes(errCode) || errCode !== 'SAFETY';
+
+    if (shouldFallback) {
+      console.warn(`[Fallback] Gemini failed (code ${errCode}), trying Groq...`);
+      const groqResult = await callGroq(history);
+
+      if (groqResult.reply) {
+        reply = groqResult.reply;
+        modelUsed = 'groq';
+      } else {
+        throw new Error('Both AI providers are currently unavailable. Please try again shortly.');
+      }
+    } else {
+      // Safety block — don't fallback, just surface it
+      throw new Error('Response blocked by safety filters.');
+    }
+  }
+
+  console.log(`[AI] Responded via ${modelUsed}`);
+
+  // Trim to Discord's limit
   const trimmed = reply.length > 1800 ? reply.slice(0, 1797) + '...' : reply;
-
   addToHistory(userId, 'assistant', trimmed);
   return trimmed;
 }
@@ -146,7 +209,8 @@ const client = new Client({
 
 client.once(Events.ClientReady, () => {
   console.log(`AeriumCraft AI Bot is online as ${client.user.tag}`);
-  console.log(`Gemini model: ${GEMINI_MODEL}`);
+  console.log(`Primary model : ${GEMINI_MODEL}`);
+  console.log(`Fallback model: ${GROQ_MODEL}`);
   console.log(`Allowed channel: ${ALLOWED_CHANNEL}`);
 });
 
